@@ -19,6 +19,9 @@ from datahub.emitter.mce_builder import (
     make_dataset_urn,
     make_domain_urn,
 )
+
+from datahub.emitter.mcp import MetadataChangeProposalWrapper
+
 from datahub.emitter.mcp_builder import add_domain_to_entity_wu
 from datahub.ingestion.api.common import PipelineContext
 from datahub.ingestion.api.decorators import (
@@ -53,18 +56,113 @@ from datahub.metadata.com.linkedin.pegasus2avro.metadata.snapshot import (
     DashboardSnapshot,
 )
 from datahub.metadata.com.linkedin.pegasus2avro.mxe import MetadataChangeEvent
+
 from datahub.metadata.schema_classes import (
     ChartInfoClass,
     ChartTypeClass,
     DashboardInfoClass,
+    GlobalTagsClass,
+    TagAssociationClass,
+    ViewPropertiesClass,
+    SubTypesClass,
+    OwnerClass,
+    OwnershipClass,
+    OwnershipTypeClass,
 )
+
+from datahub.ingestion.source.common.subtypes import (
+    DatasetSubTypes,
+)
+from datahub.metadata.com.linkedin.pegasus2avro.schema import (
+    NullTypeClass,
+    OtherSchema,
+    SchemaField,
+    SchemaFieldDataType,
+    SchemaMetadata,
+    ArrayTypeClass,
+    BooleanTypeClass,
+    DateTypeClass,
+    NumberTypeClass,
+    StringTypeClass,
+    TimeTypeClass,
+)
+
+from datahub.metadata.com.linkedin.pegasus2avro.metadata.snapshot import DatasetSnapshot
+from datahub.metadata.com.linkedin.pegasus2avro.dataset import DatasetProperties
 from datahub.utilities import config_clean
 from datahub.utilities.registries.domain_registry import DomainRegistry
+from datahub.utilities.urn_encoder import UrnEncoder
 
 logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 25
 
+FIELD_TYPE_MAPPING = {
+    "BIGINT": NumberTypeClass,
+    "INT8": NumberTypeClass,
+    "BIGSERIAL": NumberTypeClass,
+    "SERIAL8": NumberTypeClass,
+    "BIT": StringTypeClass,
+    "VARBIT": StringTypeClass,
+    "BIT VARYING": StringTypeClass,
+    "BOOLEAN": BooleanTypeClass,
+    "BOOL": BooleanTypeClass,
+    "BOX": NullTypeClass,
+    "CHARACTER": StringTypeClass,
+    "CHAR": StringTypeClass,
+    "CHARACTER VARYING": StringTypeClass,
+    "VARCHAR": StringTypeClass,
+    "CIDR": StringTypeClass,
+    "CIRCLE": NullTypeClass,
+    "DATE": DateTypeClass,
+    "DOUBLE PRECISION": NumberTypeClass,
+    "FLOAT8": NumberTypeClass,
+    "INET": StringTypeClass,
+    "INTEGER": NumberTypeClass,
+    "INT": NumberTypeClass,
+    "INT4": NumberTypeClass,
+    "INTERVAL": StringTypeClass,
+    "JSON": StringTypeClass,
+    "JSONB": StringTypeClass,
+    "LINE": NullTypeClass,
+    "LSEG": NullTypeClass,
+    "MACADDR": StringTypeClass,
+    "MACADDR8": StringTypeClass,
+    "MONEY": NumberTypeClass,
+    "NUMERIC": NumberTypeClass,
+    "DECIMAL": NumberTypeClass,
+    "PATH": NullTypeClass,
+    "PG_LSN": StringTypeClass,
+    "POINT": NullTypeClass,
+    "POLYGON": NullTypeClass,
+    "REAL": NumberTypeClass,
+    "FLOAT4": NumberTypeClass,
+    "SMALLINT": NumberTypeClass,
+    "INT2": NumberTypeClass,
+    "SMALLSERIAL": NumberTypeClass,
+    "SERIAL2": NumberTypeClass,
+    "SERIAL": NumberTypeClass,
+    "SERIAL4": NumberTypeClass,
+    "STRING": StringTypeClass,
+    "TEXT": StringTypeClass,
+    "TIME": TimeTypeClass,
+    "TIME WITHOUT TIME ZONE": TimeTypeClass,
+    "TIME WITH TIME ZONE": TimeTypeClass,
+    "TIMETZ": TimeTypeClass,
+    "TIMESTAMP": TimeTypeClass,
+    "TIMESTAMP WITHOUT TIME ZONE": TimeTypeClass,
+    "TIMESTAMP WITH TIME ZONE": TimeTypeClass,
+    "TIMESTAMPTZ": TimeTypeClass,
+    "TSQUERY": StringTypeClass,
+    "TSVECTOR": StringTypeClass,
+    "TXID_SNAPSHOT": StringTypeClass,
+    "UUID": StringTypeClass,
+    "XML": StringTypeClass,
+    "ARRAY": ArrayTypeClass,
+    "HSTORE": StringTypeClass,
+    "RANGE": ArrayTypeClass,
+    "UNKNOWN": NullTypeClass,
+}
 
 chart_type_from_viz_type = {
     "line": ChartTypeClass.LINE,
@@ -465,9 +563,157 @@ class SupersetSource(StatefulIngestionSourceBase):
                     entity_urn=chart_snapshot.urn,
                 )
 
+    def get_schema_metadata(self, json_payload: dict) -> Optional[SchemaMetadata]:
+        columns = json_payload.get("result").get("columns")
+
+        fields = []
+        for field in columns:
+            column_name = field.get("column_name")
+            if column_name is None:
+                # Skip field as it has no name
+                continue
+
+            native_data_type = field.get("type", "UNKNOWN") if field.get("type") else "UNKNOWN"
+            type_class = FIELD_TYPE_MAPPING.get(native_data_type, NullTypeClass)
+
+            global_tags = None
+            calculated = "Calculated" if field.get("expression") else None
+            if calculated:
+                global_tags = GlobalTagsClass(tags=[
+                    TagAssociationClass(f"urn:li:tag:Calculated")
+                ])
+
+            schema_field = SchemaField(fieldPath=column_name,
+                                       type=SchemaFieldDataType(type=type_class()),
+                                       nativeDataType=native_data_type,
+                                       description=field.get("description"),
+                                       globalTags=global_tags,
+                                       )
+            fields.append(schema_field)
+
+        schema_metadata = SchemaMetadata(
+            schemaName=json_payload.get("result", {}).get("datasource_name", "unknown"),
+            platform=f"urn:li:dataPlatform:{self.platform}",
+            version=0,
+            fields=fields,
+            hash="",
+            platformSchema=OtherSchema(rawSchema=""),
+        )
+
+        return schema_metadata
+
+    def _get_ownership(self, user: str) -> Optional[OwnershipClass]:
+        if user:
+            owner_urn = DEFAULT_ENV.make_user_urn(user)
+            ownership: OwnershipClass = OwnershipClass(
+                owners=[
+                    OwnerClass(
+                        owner=owner_urn,
+                        type=OwnershipTypeClass.DATAOWNER,
+                    )
+                ]
+            )
+            return ownership
+
+        return None
+
+    def construct_dataset_snapshot(self, dataset_data: dict) -> DatasetSnapshot:
+        dataset_id = dataset_data.get("id")
+        dataset_name = dataset_data.get("table_name")
+        schema_name = dataset_data.get("schema")
+        database_name = dataset_data.get("database").get("database_name")
+        dataset_type = dataset_data.get("kind")
+        dataset_query = dataset_data.get("sql")
+        owners = dataset_data.get("owners")
+
+        dataset_urn = self.get_datasource_urn_from_id(dataset_id)
+
+        modified_ts = int(dp.parse(dataset_data.get("changed_on_utc", "now")).timestamp() * 1000)
+        modified_actor = "urn:li:corpuser:datahub"
+
+        last_modified = ChangeAuditStamps(
+            created=AuditStamp(time=modified_ts, actor=modified_actor),
+            lastModified=AuditStamp(time=modified_ts, actor=modified_actor),
+        )
+        dataset_status = Status(removed=False)
+
+        dataset_properties = DatasetProperties(description=dataset_data.get("description", ""),
+                                               customProperties={"type": dataset_type,
+                                                                 "database_name": database_name,
+                                                                 "schema_name": schema_name,
+                                                                 "owners": ','.join(owners)},
+                                               tags=[],
+                                               )
+
+        dataset_snapshot = DatasetSnapshot(urn=dataset_urn,
+                                           aspects=[dataset_properties, dataset_status]
+                                           )
+        owner = (
+            self._get_ownership(','.join(owners))
+            if owners
+            else None
+        )
+        if owner is not None:
+            dataset_snapshot.aspects.append(owner)
+
+        if dataset_type == "virtual":
+            view_properties = ViewPropertiesClass(
+                materialized=False,
+                viewLanguage="SQL",
+                viewLogic=UrnEncoder.encode_string(dataset_query),
+            )
+            dataset_snapshot.aspects.append(view_properties)
+
+            subtypes = SubTypesClass(typeNames=[DatasetSubTypes.VIEW])
+
+        data_response = self.session.get(
+            f"{self.config.connect_uri}/api/v1/dataset/{dataset_id}"
+        )
+        if data_response.status_code != 200:
+            logger.warning(f"Couldn't get dataset data: {data_response.text}")
+        data_response.raise_for_status()
+
+        payload = data_response.json()
+        schema_metadata = self.get_schema_metadata(payload)
+        if schema_metadata is not None:
+            dataset_snapshot.aspects.append(schema_metadata)
+
+        return dataset_snapshot
+
+    def emit_dataset_mces(self) -> Iterable[MetadataWorkUnit]:
+        current_dataset_page = 0
+
+        total_datasets = PAGE_SIZE
+
+        while current_dataset_page * PAGE_SIZE <= total_datasets:
+            dataset_response = self.session.get(
+                f"{self.config.connect_uri}/api/v1/dataset/",
+                params=f"q=(page:{current_dataset_page},page_size:{PAGE_SIZE})"
+            )
+            if dataset_response.status_code != 200:
+                logger.warning(f"Couldn't get dataset data: {dataset_response.text}")
+            dataset_response.raise_for_status()
+
+            current_dataset_page += 1
+
+            payload = dataset_response.json()
+            total_datasets = payload["count"]
+            for dataset_data in payload["result"]:
+                dataset_snapshot = self.construct_dataset_snapshot(dataset_data)
+
+                mce = MetadataChangeEvent(proposedSnapshot=dataset_snapshot)
+                yield MetadataWorkUnit(id=dataset_snapshot.urn, mce=mce)
+
+                if dataset_data.get("kind") == "virtual":
+                    yield MetadataChangeProposalWrapper(
+                        entityUrn=dataset_snapshot.urn,
+                        aspect=SubTypesClass(typeNames=[DatasetSubTypes.VIEW]),
+                    ).as_workunit()
+
     def get_workunits_internal(self) -> Iterable[MetadataWorkUnit]:
         yield from self.emit_dashboard_mces()
         yield from self.emit_chart_mces()
+        yield from self.emit_dataset_mces()
 
     def get_workunit_processors(self) -> List[Optional[MetadataWorkUnitProcessor]]:
         return [
